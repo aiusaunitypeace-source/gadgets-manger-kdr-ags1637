@@ -843,9 +843,29 @@ document.getElementById("edit-cancel").addEventListener("click", () => {
 document.getElementById("edit-clear-interest").addEventListener("click", () => {
   const docId = document.getElementById("edit-doc-id").value;
   if (!docId) return;
-  showModal("Clear all interest dates for this record?", () => {
+  showModal("Clear all interest dates for this record? Already-accrued profit will be subtracted from monthly stats.", () => {
     const rec = allRecords.find(r => r._docId === docId);
-    if (rec) rec.interestDates = [];
+    if (rec) {
+      // Deduct profit for each cleared interest date
+      const profitPerCycle = Math.ceil((Number(rec.price) || 0) / 500) * 50;
+      const clearedDates = rec.interestDates || [];
+      for (const d of clearedDates) {
+        let dt;
+        if (d.includes(".")) {
+          dt = parseDDMMYY(d);
+        } else {
+          dt = new Date(d);
+        }
+        if (dt && !isNaN(dt.getTime())) {
+          const key = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}`;
+          if (monthlyStats[key]) {
+            monthlyStats[key].profit = Math.max(0, (monthlyStats[key].profit || 0) - profitPerCycle);
+            if (monthlyStats[key].cost === 0 && monthlyStats[key].profit === 0) delete monthlyStats[key];
+          }
+        }
+      }
+      rec.interestDates = [];
+    }
     saveToLocalStorage();
     document.getElementById("edit-modal").classList.add("hidden");
     renderRecords(); renderReturned(); renderSold(); renderPending();
