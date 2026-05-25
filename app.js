@@ -1,17 +1,18 @@
-// ── Static Local Storage Architecture ──────────────────────────────────────────
-// No Firebase. No Supabase. No backends.
-// Data source: CSV file fetched via fetch() + localStorage for mutations.
+// ── Supabase Cloud Architecture ───────────────────────────────────────────────
+// GitHub = deployment only (hosting/domain)
+// Supabase = cloud database (PostgreSQL)
+// Data is synced across all devices in real-time
 
 // ── State ────────────────────────────────────────────────────────────────────
 let allRecords    = [];
-let monthlyStats  = {};  // only used for cost tracking (records-based profit is dynamic)
+let monthlyStats  = {};
 let chartInstance = null;
 let pendingAction = null;
 let selectedYear  = new Date().getFullYear();
+let isLoading     = true;
 
-const STORAGE_KEY       = "gadget_manager_records";
-const MONTHLY_KEY       = "gadget_manager_monthly";
-const CSV_PATH          = "records.csv"; // relative path for GitHub Pages
+// Connection status element
+const connStatus = document.getElementById("connection-status");
 
 // ── Navigation ───────────────────────────────────────────────────────────────
 document.querySelectorAll(".nav-btn").forEach(btn => {
@@ -41,8 +42,7 @@ function monthKey(isoStr) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
-// ── DYNAMIC INTEREST PROFIT CALCULATION ───────────────────────────────────────
-// Always computed from current records — NEVER stale.
+// ── Dynamic Interest Profit Calculation ───────────────────────────────────────
 function interestProfitPerCycle(price) {
   return Math.ceil((Number(price) || 0) / 500) * 50;
 }
@@ -55,7 +55,6 @@ function calculateTotalInterestProfit() {
 }
 
 function calculateMonthlyProfit() {
-  // Returns { "2026-04": 150, "2026-05": 100, ... }
   const result = {};
   allRecords.forEach(r => {
     const dates = r.interestDates || [];
@@ -76,24 +75,196 @@ function calculateMonthlyProfit() {
   return result;
 }
 
-// ── Storage helpers ───────────────────────────────────────────────────────────
-function saveToLocalStorage() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(allRecords));
-  localStorage.setItem(MONTHLY_KEY, JSON.stringify(monthlyStats));
+// ── Supabase Helpers ──────────────────────────────────────────────────────────
+const TABLE_RECORDS = "gadgets";
+const TABLE_MONTHLY = "monthly_stats";
+
+function setConnStatus(text, color) {
+  if (connStatus) {
+    connStatus.textContent = text;
+    connStatus.style.color = color || "#d4d4d4";
+  }
 }
 
-function addToMonthly(isoStr, price) {
-  const key = monthKey(isoStr);
-  if (!monthlyStats[key]) monthlyStats[key] = { cost: 0, profit: 0 };
-  monthlyStats[key].cost   = (monthlyStats[key].cost   || 0) + price;
-  saveToLocalStorage();
+async function supabaseFetchAll() {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const { data, error } = await supabaseClient
+    .from(TABLE_RECORDS)
+    .select("*")
+    .order("created_date", { ascending: false });
+  if (error) throw error;
+  return data || [];
 }
 
-function generateId() {
-  return "_local_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+async function supabaseFetchMonthly() {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const { data, error } = await supabaseClient
+    .from(TABLE_MONTHLY)
+    .select("*");
+  if (error) throw error;
+  const map = {};
+  (data || []).forEach(row => {
+    map[row.month_key] = { cost: row.cost || 0, profit: row.profit || 0 };
+  });
+  return map;
 }
 
-// ── CSV Parsing ───────────────────────────────────────────────────────────────
+async function supabaseInsert(record) {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const { data, error } = await supabaseClient
+    .from(TABLE_RECORDS)
+    .insert({
+      record_id: record.id,
+      date: record.date,
+      description: record.description,
+      options: record.options || [],
+      phone: record.phone,
+      price: Number(record.price) || 0,
+      created_date: record.createdDate || new Date().toISOString(),
+      interest_dates: record.interestDates || [],
+      status: record.status || "active",
+      returned_date: record.returnedDate || null,
+      sold_date: record.soldDate || null,
+      is_dummy: record.isDummy || false
+    })
+    .select();
+  if (error) throw error;
+  return data ? data[0] : null;
+}
+
+async function supabaseUpdate(id, updates) {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const dbUpdates = {};
+  if (updates.record_id !== undefined) dbUpdates.record_id = updates.record_id;
+  if (updates.id !== undefined) dbUpdates.record_id = updates.id;
+  if (updates.date !== undefined) dbUpdates.date = updates.date;
+  if (updates.description !== undefined) dbUpdates.description = updates.description;
+  if (updates.options !== undefined) dbUpdates.options = updates.options;
+  if (updates.phone !== undefined) dbUpdates.phone = updates.phone;
+  if (updates.price !== undefined) dbUpdates.price = Number(updates.price);
+  if (updates.interestDates !== undefined) dbUpdates.interest_dates = updates.interestDates;
+  if (updates.status !== undefined) dbUpdates.status = updates.status;
+  if (updates.returnedDate !== undefined) dbUpdates.returned_date = updates.returnedDate;
+  if (updates.soldDate !== undefined) dbUpdates.sold_date = updates.soldDate;
+  if (updates.isDummy !== undefined) dbUpdates.is_dummy = updates.isDummy;
+
+  const { error } = await supabaseClient
+    .from(TABLE_RECORDS)
+    .update(dbUpdates)
+    .eq("id", id);
+  if (error) throw error;
+}
+
+async function supabaseDelete(id) {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const { error } = await supabaseClient
+    .from(TABLE_RECORDS)
+    .delete()
+    .eq("id", id);
+  if (error) throw error;
+}
+
+async function supabaseDeleteByStatus(status) {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const ids = allRecords.filter(r => r.status === status).map(r => r._dbId).filter(Boolean);
+  if (ids.length === 0) return;
+  const { error } = await supabaseClient
+    .from(TABLE_RECORDS)
+    .delete()
+    .in("id", ids);
+  if (error) throw error;
+}
+
+async function supabaseUpsertMonthly(monthKey, cost, profit) {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const { data: existing } = await supabaseClient
+    .from(TABLE_MONTHLY)
+    .select("*")
+    .eq("month_key", monthKey)
+    .maybeSingle();
+  if (existing) {
+    const { error } = await supabaseClient
+      .from(TABLE_MONTHLY)
+      .update({ cost, profit })
+      .eq("id", existing.id);
+    if (error) throw error;
+  } else {
+    const { error } = await supabaseClient
+      .from(TABLE_MONTHLY)
+      .insert({ month_key: monthKey, cost, profit });
+    if (error) throw error;
+  }
+}
+
+async function supabaseDeleteMonthly(monthKey) {
+  if (!supabaseClient) throw new Error("Supabase not configured");
+  const { error } = await supabaseClient
+    .from(TABLE_MONTHLY)
+    .delete()
+    .eq("month_key", monthKey);
+  if (error) throw error;
+}
+
+// ── Data Load ─────────────────────────────────────────────────────────────────
+async function loadData() {
+  if (!supabaseClient) {
+    connStatus.textContent = "⚠️ Supabase not configured — set SUPABASE_URL & SUPABASE_ANON_KEY in supabase-config.js";
+    connStatus.style.color = "#ea580c";
+    return;
+  }
+
+  setConnStatus("🔄 Loading from Supabase...", "#d4d4d4");
+  isLoading = true;
+
+  try {
+    const [records, monthly] = await Promise.all([
+      supabaseFetchAll(),
+      supabaseFetchMonthly()
+    ]);
+
+    // Transform Supabase records to app format
+    allRecords = records.map(row => ({
+      _dbId: row.id,
+      _docId: "db_" + row.id,
+      id: row.record_id || "",
+      date: row.date || "",
+      description: row.description || "",
+      options: row.options || [],
+      phone: row.phone || "",
+      price: Number(row.price) || 0,
+      createdDate: row.created_date || new Date().toISOString(),
+      interestDates: row.interest_dates || [],
+      status: row.status || "active",
+      returnedDate: row.returned_date || null,
+      soldDate: row.sold_date || null,
+      isDummy: row.is_dummy || false
+    }));
+
+    monthlyStats = monthly;
+
+    setConnStatus("✅ Connected — " + allRecords.length + " records loaded", "#16a34a");
+    isLoading = false;
+    updateStorageBars();
+    renderRecords();
+    renderReturned();
+    renderSold();
+    renderPending();
+    const statsPage = document.getElementById("page-stats");
+    if (statsPage && statsPage.classList.contains("active")) renderStats();
+  } catch (err) {
+    setConnStatus("❌ Supabase error: " + err.message, "#dc2626");
+    isLoading = false;
+    allRecords = [];
+    monthlyStats = {};
+    updateStorageBars();
+    renderRecords();
+    renderReturned();
+    renderSold();
+    renderPending();
+  }
+}
+
+// ── CSV Parsing (for bulk import) ─────────────────────────────────────────────
 function parseCSVLine(line) {
   const result = []; let cur = "", inQ = false;
   for (const ch of line) {
@@ -109,100 +280,6 @@ function extractPhoneFromText(text) {
   const digits = (text.match(/\d+/g) || []).join("");
   const m = digits.match(/[6-9]\d{9}/);
   return m ? m[0] : "";
-}
-
-// ── Load from CSV + localStorage ─────────────────────────────────────────────
-async function loadData() {
-  // 1. Load localStorage state first
-  const stored = localStorage.getItem(STORAGE_KEY);
-  const storedMonthly = localStorage.getItem(MONTHLY_KEY);
-  if (stored) {
-    try { allRecords = JSON.parse(stored); } catch(e) { allRecords = []; }
-  }
-  if (storedMonthly) {
-    try { monthlyStats = JSON.parse(storedMonthly); } catch(e) { monthlyStats = {}; }
-  }
-
-  // 2. Try to load CSV records and merge
-  try {
-    const resp = await fetch(CSV_PATH);
-    if (resp.ok) {
-      const text = await resp.text();
-      const lines = text.trim().split("\n").filter(l => l.trim());
-      if (lines.length > 1) {
-        const headers    = parseCSVLine(lines[0]).map(h => h.toLowerCase().trim());
-        const idIdx      = headers.findIndex(h => h === "id");
-        const dateIdx    = headers.findIndex(h => h === "date");
-        const nameIdx    = headers.findIndex(h => h === "name" || h === "description");
-        const priceIdx   = headers.findIndex(h => h === "price");
-        const phoneIdx   = headers.findIndex(h => h === "phone");
-        const optionsIdx = headers.findIndex(h => h === "options");
-        const createdIdx = headers.findIndex(h => h.includes("created"));
-        const interestIdx= headers.findIndex(h => h.includes("interest"));
-        const statusIdx  = headers.findIndex(h => h === "status");
-
-        const csvRecords = [];
-        for (let i = 1; i < lines.length; i++) {
-          if (!lines[i].trim()) continue;
-          const cols = parseCSVLine(lines[i]);
-          const name = cols[nameIdx] || "";
-          const phone = phoneIdx >= 0 && cols[phoneIdx] ? cols[phoneIdx] : extractPhoneFromText(name);
-
-          let interestDates = [];
-          if (interestIdx >= 0 && cols[interestIdx]) {
-            interestDates = cols[interestIdx].split("|").map(s => s.trim()).filter(Boolean);
-          }
-
-          let createdDate = new Date().toISOString();
-          if (createdIdx >= 0 && cols[createdIdx]) {
-            const v = cols[createdIdx].trim();
-            const m = v.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
-            if (m) {
-              let [, d, mo, y] = m;
-              if (y.length === 2) y = "20" + y;
-              createdDate = new Date(parseInt(y), parseInt(mo)-1, parseInt(d)).toISOString();
-            } else {
-              const d = new Date(v);
-              if (!isNaN(d.getTime())) createdDate = d.toISOString();
-            }
-          }
-
-          const record = {
-            _docId: "csv_" + i,
-            id: idIdx >= 0 ? (cols[idIdx] || "") : "",
-            date: dateIdx >= 0 ? (cols[dateIdx] || "") : "",
-            description: name,
-            options: optionsIdx >= 0 && cols[optionsIdx] ? cols[optionsIdx].split("|").map(o=>o.trim()).filter(Boolean) : [],
-            phone,
-            price: priceIdx >= 0 ? (parseFloat(cols[priceIdx]) || 0) : 0,
-            createdDate,
-            interestDates,
-            status: statusIdx >= 0 ? (cols[statusIdx] || "active") : "active",
-            returnedDate: null,
-            soldDate: null,
-            isDummy: false,
-            _fromCSV: true
-          };
-          csvRecords.push(record);
-        }
-
-        const localOnly = allRecords.filter(r => !r._fromCSV);
-        allRecords = [...csvRecords, ...localOnly];
-      }
-    }
-  } catch(e) {
-    console.warn("CSV load failed (expected on first run or missing file):", e);
-  }
-
-  allRecords.sort((a, b) => new Date(b.createdDate) - new Date(a.createdDate));
-  saveToLocalStorage();
-  updateStorageBars();
-  renderRecords();
-  renderReturned();
-  renderSold();
-  renderPending();
-  const statsPage = document.getElementById("page-stats");
-  if (statsPage && statsPage.classList.contains("active")) renderStats();
 }
 
 // ── Bulk Import CSV ───────────────────────────────────────────────────────────
@@ -228,6 +305,7 @@ document.getElementById("csv-file-input").addEventListener("change", async (e) =
     const optionsIdx = headers.findIndex(h => h === "options");
     const createdIdx = headers.findIndex(h => h.includes("created"));
     if (nameIdx < 0) { msg.textContent = "Missing Description column."; msg.className = "form-msg err"; return; }
+    msg.textContent = "Uploading to Supabase...";
     let importedCount = 0;
     for (let i = 1; i < lines.length; i++) {
       if (!lines[i].trim()) continue;
@@ -248,7 +326,6 @@ document.getElementById("csv-file-input").addEventListener("change", async (e) =
         }
       }
       const record = {
-        _docId: generateId(),
         id: idIdx >= 0 ? (cols[idIdx] || "") : "",
         date: dateIdx >= 0 ? (cols[dateIdx] || "") : "",
         description: name,
@@ -262,30 +339,48 @@ document.getElementById("csv-file-input").addEventListener("change", async (e) =
         soldDate: null,
         isDummy: false
       };
-      allRecords.push(record);
-      importedCount++;
-      if (record.price && record.createdDate) addToMonthly(record.createdDate, record.price);
+      const inserted = await supabaseInsert(record);
+      if (inserted) {
+        allRecords.unshift({
+          _dbId: inserted.id,
+          _docId: "db_" + inserted.id,
+          ...record
+        });
+        importedCount++;
+      }
+      // Update monthly cost
+      if (record.price && record.createdDate) {
+        const key = monthKey(record.createdDate);
+        const newCost = (monthlyStats[key]?.cost || 0) + (Number(record.price) || 0);
+        await supabaseUpsertMonthly(key, newCost, monthlyStats[key]?.profit || 0);
+        monthlyStats[key] = { cost: newCost, profit: monthlyStats[key]?.profit || 0 };
+      }
     }
     msg.textContent = `✓ ${importedCount} records imported.`;
     msg.className = "form-msg ok";
     e.target.value = "";
-    saveToLocalStorage();
     renderRecords();
   } catch (err) {
-    msg.textContent = "Error: " + err.message;
+    msg.textContent = "Supabase error: " + err.message;
     msg.className = "form-msg err";
   }
 });
 
 // ── Clear All Active ──────────────────────────────────────────────────────────
 document.getElementById("btn-clear-active").addEventListener("click", () => {
-  showModal("Delete ALL active records permanently?", () => {
+  showModal("Delete ALL active records permanently?", async () => {
     const msg = document.getElementById("clear-msg");
-    allRecords = allRecords.filter(r => r.status !== "active");
-    saveToLocalStorage();
-    renderRecords();
-    msg.textContent = "All active records deleted.";
-    msg.className = "form-msg ok";
+    msg.textContent = "Deleting..."; msg.className = "form-msg";
+    try {
+      await supabaseDeleteByStatus("active");
+      allRecords = allRecords.filter(r => r.status !== "active");
+      msg.textContent = "All active records deleted.";
+      msg.className = "form-msg ok";
+      renderRecords();
+    } catch (e) {
+      msg.textContent = "Error: " + e.message;
+      msg.className = "form-msg err";
+    }
   });
 });
 
@@ -315,7 +410,7 @@ document.getElementById("f-price").addEventListener("input", () => {
 });
 
 // ── Submit Form ───────────────────────────────────────────────────────────────
-document.getElementById("btn-submit").addEventListener("click", () => {
+document.getElementById("btn-submit").addEventListener("click", async () => {
   const id    = document.getElementById("f-id").value.trim();
   const date  = document.getElementById("f-date").value.trim();
   const desc  = document.getElementById("f-desc").value.trim();
@@ -332,7 +427,6 @@ document.getElementById("btn-submit").addEventListener("click", () => {
 
   const now = new Date().toISOString();
   const record = {
-    _docId: generateId(),
     id, date, description: desc, options: opts,
     phone, price,
     createdDate: now,
@@ -347,19 +441,34 @@ document.getElementById("btn-submit").addEventListener("click", () => {
     record.interestDates = [todayDDMMYY()];
   }
 
-  allRecords.unshift(record);
-  addToMonthly(now, price);
-  saveToLocalStorage();
-  renderRecords();
+  try {
+    const inserted = await supabaseInsert(record);
+    if (inserted) {
+      allRecords.unshift({
+        _dbId: inserted.id,
+        _docId: "db_" + inserted.id,
+        ...record
+      });
+    }
+    // Update monthly cost
+    const key = monthKey(now);
+    const newCost = (monthlyStats[key]?.cost || 0) + price;
+    await supabaseUpsertMonthly(key, newCost, monthlyStats[key]?.profit || 0);
+    monthlyStats[key] = { cost: newCost, profit: monthlyStats[key]?.profit || 0 };
 
-  msg.textContent = "Record saved.";
-  msg.className = "form-msg ok";
-  ["f-id","f-date","f-desc","f-phone","f-price"].forEach(id => document.getElementById(id).value = "");
-  clearOptions();
-  interestToggled = false;
-  document.getElementById("btn-interest-toggle").classList.remove("selected");
-  document.getElementById("interest-toggle-label").textContent = "Interest Paid — Optional";
-  setTimeout(() => { msg.textContent = ""; }, 2500);
+    renderRecords();
+    msg.textContent = "Record saved.";
+    msg.className = "form-msg ok";
+    ["f-id","f-date","f-desc","f-phone","f-price"].forEach(id => document.getElementById(id).value = "");
+    clearOptions();
+    interestToggled = false;
+    document.getElementById("btn-interest-toggle").classList.remove("selected");
+    document.getElementById("interest-toggle-label").textContent = "Interest Paid — Optional";
+    setTimeout(() => { msg.textContent = ""; }, 2500);
+  } catch (e) {
+    msg.textContent = "Supabase error: " + e.message;
+    msg.className = "form-msg err";
+  }
 });
 
 // ── Storage limits ────────────────────────────────────────────────────────────
@@ -400,20 +509,6 @@ function renderStorageBar(elId, count, max) {
     </div>`;
 }
 
-// ── Auto-delete ─────────────────────────────────────────────────────────────
-function runAutoDelete() {
-  const now = Date.now();
-  let changed = false;
-  allRecords = allRecords.filter(r => {
-    if (r.status === "returned" && r.returnedDate)
-      if (now - new Date(r.returnedDate).getTime() > 30 * 24 * 60 * 60 * 1000) { changed = true; return false; }
-    if (r.status === "sold" && r.soldDate)
-      if (now - new Date(r.soldDate).getTime() > 365 * 24 * 60 * 60 * 1000) { changed = true; return false; }
-    return true;
-  });
-  if (changed) saveToLocalStorage();
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fmt(isoStr) {
   if (!isoStr) return "—";
@@ -437,6 +532,7 @@ function filterBySearch(records, query) {
 
 // ── Render Records ────────────────────────────────────────────────────────────
 function renderRecords() {
+  if (isLoading) return;
   const query    = document.getElementById("search-records").value;
   const active   = allRecords.filter(r => r.status === "active");
   const filtered = filterBySearch(active, query);
@@ -457,6 +553,7 @@ document.getElementById("search-records").addEventListener("input", renderRecord
 
 // ── Render Returned ───────────────────────────────────────────────────────────
 function renderReturned() {
+  if (isLoading) return;
   const query    = document.getElementById("search-returned").value;
   const returned = allRecords.filter(r => r.status === "returned")
     .sort((a, b) => new Date(b.returnedDate || 0) - new Date(a.returnedDate || 0));
@@ -469,7 +566,11 @@ function renderReturned() {
 }
 document.getElementById("search-returned").addEventListener("input", renderReturned);
 document.getElementById("clear-returned").addEventListener("click", () => {
-  showModal("Delete all returned records?", () => clearByStatus("returned"));
+  showModal("Delete all returned records?", async () => {
+    try { await supabaseDeleteByStatus("returned"); } catch(e) {}
+    allRecords = allRecords.filter(r => r.status !== "returned");
+    renderRecords(); renderReturned(); renderSold(); renderPending();
+  });
 });
 
 // ── Interest date helpers ─────────────────────────────────────────────────────
@@ -522,6 +623,7 @@ document.querySelectorAll(".pending-filters .filter-btn").forEach(btn => {
 document.getElementById("search-pending").addEventListener("input", renderPending);
 
 function renderPending() {
+  if (isLoading) return;
   const query = document.getElementById("search-pending").value;
 
   const pending = allRecords.filter(r => {
@@ -602,6 +704,7 @@ function pendingCardHTML(r) {
 
 // ── Render Sold ───────────────────────────────────────────────────────────────
 function renderSold() {
+  if (isLoading) return;
   const query    = document.getElementById("search-sold").value;
   const sold     = allRecords.filter(r => r.status === "sold")
     .sort((a, b) => new Date(b.soldDate || 0) - new Date(a.soldDate || 0));
@@ -614,17 +717,12 @@ function renderSold() {
 }
 document.getElementById("search-sold").addEventListener("input", renderSold);
 document.getElementById("clear-sold").addEventListener("click", () => {
-  showModal("Delete all sold records?", () => clearByStatus("sold"));
+  showModal("Delete all sold records?", async () => {
+    try { await supabaseDeleteByStatus("sold"); } catch(e) {}
+    allRecords = allRecords.filter(r => r.status !== "sold");
+    renderRecords(); renderReturned(); renderSold(); renderPending();
+  });
 });
-
-function clearByStatus(status) {
-  allRecords = allRecords.filter(r => r.status !== status);
-  saveToLocalStorage();
-  renderRecords();
-  renderReturned();
-  renderSold();
-  renderPending();
-}
 
 // ── Card HTML ─────────────────────────────────────────────────────────────────
 function cardHTML(r, mode) {
@@ -712,7 +810,7 @@ function cardHTML(r, mode) {
 // ── Card Events ───────────────────────────────────────────────────────────────
 function attachCardEvents(container) {
   container.querySelectorAll("[data-action]").forEach(btn => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const action = btn.dataset.action;
       const docId  = btn.dataset.doc;
 
@@ -733,63 +831,78 @@ function attachCardEvents(container) {
         return;
       }
       if (action === "dummy") {
-        showModal("Remove this record? (will not affect stats)", () => {
+        showModal("Remove this record? (will not affect stats)", async () => {
           const rec = allRecords.find(r => r._docId === docId);
           if (rec) {
             const key = monthKey(rec.createdDate);
             const price = Number(rec.price) || 0;
+            try {
+              if (rec._dbId) await supabaseDelete(rec._dbId);
+            } catch(e) {}
             if (monthlyStats[key]) {
-              monthlyStats[key].cost = Math.max(0, (monthlyStats[key].cost || 0) - price);
+              const newCost = Math.max(0, (monthlyStats[key].cost || 0) - price);
+              await supabaseUpsertMonthly(key, newCost, monthlyStats[key]?.profit || 0);
+              monthlyStats[key].cost = newCost;
               if (monthlyStats[key].cost === 0 && monthlyStats[key].profit === 0) delete monthlyStats[key];
             }
           }
           allRecords = allRecords.filter(r => r._docId !== docId);
-          saveToLocalStorage();
           renderRecords(); renderReturned(); renderSold(); renderPending();
         });
         return;
       }
       if (action === "undo") {
-        showModal("Restore this record to Active?", () => {
+        showModal("Restore this record to Active?", async () => {
           const rec = allRecords.find(r => r._docId === docId);
           if (rec) {
             rec.status = "active";
             rec.returnedDate = null;
             rec.soldDate = null;
             rec.interestDates = [];
-            saveToLocalStorage();
+            try {
+              if (rec._dbId) await supabaseUpdate(rec._dbId, { status: "active", returnedDate: null, soldDate: null, interestDates: [] });
+            } catch(e) {}
             renderRecords(); renderReturned(); renderSold(); renderPending();
           }
         });
         return;
       }
       if (action === "delete") {
-        showModal("Delete this record permanently?", () => {
+        showModal("Delete this record permanently?", async () => {
+          const rec = allRecords.find(r => r._docId === docId);
+          if (rec) {
+            try {
+              if (rec._dbId) await supabaseDelete(rec._dbId);
+            } catch(e) {}
+          }
           allRecords = allRecords.filter(r => r._docId !== docId);
-          saveToLocalStorage();
           renderRecords(); renderReturned(); renderSold(); renderPending();
         });
         return;
       }
       if (action === "returned") {
-        showModal("Mark as Returned?", () => {
+        showModal("Mark as Returned?", async () => {
           const rec = allRecords.find(r => r._docId === docId);
           if (rec) {
             rec.status = "returned";
             rec.returnedDate = new Date().toISOString();
-            saveToLocalStorage();
+            try {
+              if (rec._dbId) await supabaseUpdate(rec._dbId, { status: "returned", returnedDate: rec.returnedDate });
+            } catch(e) {}
             renderRecords(); renderReturned(); renderSold(); renderPending();
           }
         });
         return;
       }
       if (action === "sold") {
-        showModal("Mark as Sold?", () => {
+        showModal("Mark as Sold?", async () => {
           const rec = allRecords.find(r => r._docId === docId);
           if (rec) {
             rec.status = "sold";
             rec.soldDate = new Date().toISOString();
-            saveToLocalStorage();
+            try {
+              if (rec._dbId) await supabaseUpdate(rec._dbId, { status: "sold", soldDate: rec.soldDate });
+            } catch(e) {}
             renderRecords(); renderReturned(); renderSold(); renderPending();
           }
         });
@@ -800,10 +913,11 @@ function attachCardEvents(container) {
         if (!rec) return;
         const dates = rec.interestDates || [];
         const today = todayDDMMYY();
-        showModal(`Record interest paid (${today})?`, () => {
-          // Just add the date to the record — profit is calculated dynamically
+        showModal(`Record interest paid (${today})?`, async () => {
           rec.interestDates = [...dates, today];
-          saveToLocalStorage();
+          try {
+            if (rec._dbId) await supabaseUpdate(rec._dbId, { interestDates: rec.interestDates });
+          } catch(e) {}
           renderRecords(); renderReturned(); renderSold(); renderPending();
         });
       }
@@ -812,7 +926,7 @@ function attachCardEvents(container) {
 }
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
-document.getElementById("edit-bulk-add").addEventListener("click", () => {
+document.getElementById("edit-bulk-add").addEventListener("click", async () => {
   const docId = document.getElementById("edit-doc-id").value;
   const input = document.getElementById("edit-bulk-dates").value.trim();
   const msg   = document.getElementById("edit-bulk-msg");
@@ -834,9 +948,10 @@ document.getElementById("edit-bulk-add").addEventListener("click", () => {
 
   if (invalid.length) { msg.textContent = `Invalid: ${invalid.join(", ")}`; msg.className = "form-msg err"; return; }
 
-  // Just update the record's interest dates — profit is calculated dynamically
   rec.interestDates = [...existing];
-  saveToLocalStorage();
+  try {
+    if (rec._dbId) await supabaseUpdate(rec._dbId, { interestDates: rec.interestDates });
+  } catch(e) {}
 
   let resultMsg = `✓ ${added.length} date(s) added.`;
   if (dupes.length) resultMsg += ` ${dupes.length} duplicate(s) skipped.`;
@@ -849,21 +964,23 @@ document.getElementById("edit-cancel").addEventListener("click", () => {
   document.getElementById("edit-modal").classList.add("hidden");
 });
 
-document.getElementById("edit-clear-interest").addEventListener("click", () => {
+document.getElementById("edit-clear-interest").addEventListener("click", async () => {
   const docId = document.getElementById("edit-doc-id").value;
   if (!docId) return;
-  showModal("Clear all interest dates for this record?", () => {
+  showModal("Clear all interest dates for this record?", async () => {
     const rec = allRecords.find(r => r._docId === docId);
     if (rec) {
       rec.interestDates = [];
+      try {
+        if (rec._dbId) await supabaseUpdate(rec._dbId, { interestDates: [] });
+      } catch(e) {}
     }
-    saveToLocalStorage();
     document.getElementById("edit-modal").classList.add("hidden");
     renderRecords(); renderReturned(); renderSold(); renderPending();
   });
 });
 
-document.getElementById("edit-confirm").addEventListener("click", () => {
+document.getElementById("edit-confirm").addEventListener("click", async () => {
   const docId = document.getElementById("edit-doc-id").value;
   const rec = allRecords.find(r => r._docId === docId);
   if (rec) {
@@ -872,7 +989,9 @@ document.getElementById("edit-confirm").addEventListener("click", () => {
     rec.description = document.getElementById("edit-desc").value.trim();
     rec.phone       = document.getElementById("edit-phone").value.trim();
     rec.price       = parseFloat(document.getElementById("edit-price").value) || 0;
-    saveToLocalStorage();
+    try {
+      if (rec._dbId) await supabaseUpdate(rec._dbId, rec);
+    } catch(e) {}
     renderRecords(); renderReturned(); renderSold(); renderPending();
   }
   document.getElementById("edit-modal").classList.add("hidden");
@@ -895,6 +1014,7 @@ document.getElementById("modal-confirm").addEventListener("click", async () => {
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 function renderStats() {
+  if (isLoading) return;
   const active      = allRecords.filter(r => r.status === "active");
   const activeValue = active.reduce((s, r) => s + (Number(r.price) || 0), 0);
   const activeProfit = calculateTotalInterestProfit();
@@ -905,7 +1025,6 @@ function renderStats() {
   document.getElementById("stat-count-sold").textContent     = allRecords.filter(r => r.status === "sold").length;
   document.getElementById("stat-count-returned").textContent = allRecords.filter(r => r.status === "returned").length;
 
-  // Compute cost from live records
   const computed = {};
   allRecords.forEach(r => {
     if (r.isDummy) return;
@@ -915,7 +1034,6 @@ function renderStats() {
     computed[key].cost += Number(r.price) || 0;
   });
 
-  // Build merged data: cost from computed, profit dynamically from records
   const monthlyProfit = calculateMonthlyProfit();
   const merged = {};
   const allKeys = new Set([...Object.keys(computed), ...Object.keys(monthlyProfit), ...Object.keys(monthlyStats)]);
@@ -930,7 +1048,7 @@ function renderStats() {
   renderMonthlyList(merged);
 }
 
-// ── Monthly list (newest first, last 12 months, hide zeros, tap to delete) ────
+// ── Monthly list ──────────────────────────────────────────────────────────────
 const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 function renderMonthlyList(merged) {
@@ -963,13 +1081,12 @@ function renderMonthlyList(merged) {
     </div>
   `).join("");
 
-  // Tap to delete month (only affects persisted cost in monthlyStats, profit is dynamic)
   el.querySelectorAll(".month-row[data-month-key]").forEach(row => {
-    row.addEventListener("click", () => {
+    row.addEventListener("click", async () => {
       const key = row.dataset.monthKey;
-      showModal(`Delete data for ${key}? This cannot be undone.`, () => {
+      showModal(`Delete data for ${key}? This cannot be undone.`, async () => {
+        try { await supabaseDeleteMonthly(key); } catch(e) {}
         delete monthlyStats[key];
-        saveToLocalStorage();
         renderStats();
       });
     });
@@ -978,7 +1095,7 @@ function renderMonthlyList(merged) {
   renderChart(merged);
 }
 
-// ── Chart: Jan 2026 → current month ──────────────────────────────────────────
+// ── Chart ─────────────────────────────────────────────────────────────────────
 function renderChart(merged) {
   const labels = [], costData = [], profitData = [];
   const start = new Date(2026, 0, 1);
@@ -1021,11 +1138,15 @@ function renderChart(merged) {
 
 // ── Reset Profits ─────────────────────────────────────────────────────────────
 document.getElementById("btn-reset-profits").addEventListener("click", () => {
-  showModal("Reset ALL monthly profits to zero? This cannot be undone.", () => {
+  showModal("Reset ALL monthly profits to zero? This cannot be undone.", async () => {
     const msg = document.getElementById("reset-msg");
-    // Clear all interest dates from all records
     allRecords.forEach(r => { r.interestDates = []; });
-    saveToLocalStorage();
+    // Update all records in Supabase
+    for (const r of allRecords) {
+      try {
+        if (r._dbId) await supabaseUpdate(r._dbId, { interestDates: [] });
+      } catch(e) {}
+    }
     msg.textContent = "All profits reset to zero.";
     msg.className = "form-msg ok";
     setTimeout(() => { msg.textContent = ""; }, 3000);
