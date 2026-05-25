@@ -4,7 +4,7 @@
 
 // ── State ────────────────────────────────────────────────────────────────────
 let allRecords    = [];
-let monthlyStats  = {};
+let monthlyStats  = {};  // only used for cost tracking (records-based profit is dynamic)
 let chartInstance = null;
 let pendingAction = null;
 let selectedYear  = new Date().getFullYear();
@@ -41,17 +41,51 @@ function monthKey(isoStr) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
+// ── DYNAMIC INTEREST PROFIT CALCULATION ───────────────────────────────────────
+// Always computed from current records — NEVER stale.
+function interestProfitPerCycle(price) {
+  return Math.ceil((Number(price) || 0) / 500) * 50;
+}
+
+function calculateTotalInterestProfit() {
+  return allRecords.reduce((sum, r) => {
+    const dates = r.interestDates || [];
+    return sum + (dates.length * interestProfitPerCycle(r.price));
+  }, 0);
+}
+
+function calculateMonthlyProfit() {
+  // Returns { "2026-04": 150, "2026-05": 100, ... }
+  const result = {};
+  allRecords.forEach(r => {
+    const dates = r.interestDates || [];
+    const profitPer = interestProfitPerCycle(r.price);
+    dates.forEach(d => {
+      let dt;
+      if (d.includes(".")) {
+        dt = parseDDMMYY(d);
+      } else {
+        dt = new Date(d);
+      }
+      if (dt && !isNaN(dt.getTime())) {
+        const key = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}`;
+        result[key] = (result[key] || 0) + profitPer;
+      }
+    });
+  });
+  return result;
+}
+
 // ── Storage helpers ───────────────────────────────────────────────────────────
 function saveToLocalStorage() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(allRecords));
   localStorage.setItem(MONTHLY_KEY, JSON.stringify(monthlyStats));
 }
 
-function addToMonthly(isoStr, price, profitToAdd) {
+function addToMonthly(isoStr, price) {
   const key = monthKey(isoStr);
   if (!monthlyStats[key]) monthlyStats[key] = { cost: 0, profit: 0 };
   monthlyStats[key].cost   = (monthlyStats[key].cost   || 0) + price;
-  monthlyStats[key].profit = (monthlyStats[key].profit || 0) + (profitToAdd || 0);
   saveToLocalStorage();
 }
 
@@ -114,13 +148,11 @@ async function loadData() {
           const name = cols[nameIdx] || "";
           const phone = phoneIdx >= 0 && cols[phoneIdx] ? cols[phoneIdx] : extractPhoneFromText(name);
 
-          // Parse interest dates
           let interestDates = [];
           if (interestIdx >= 0 && cols[interestIdx]) {
             interestDates = cols[interestIdx].split("|").map(s => s.trim()).filter(Boolean);
           }
 
-          // Parse createdDate
           let createdDate = new Date().toISOString();
           if (createdIdx >= 0 && cols[createdIdx]) {
             const v = cols[createdIdx].trim();
@@ -154,14 +186,7 @@ async function loadData() {
           csvRecords.push(record);
         }
 
-        // Merge: CSV records are base, localStorage records override by _docId or add new
-        const csvIds   = new Set(csvRecords.map(r => r._docId));
-        const localIds = new Set(allRecords.filter(r => r._docId && !r._fromCSV).map(r => r._docId));
-
-        // Keep only localStorage records that are NOT from CSV (i.e. user-added)
         const localOnly = allRecords.filter(r => !r._fromCSV);
-
-        // Merge: base CSV + local additions
         allRecords = [...csvRecords, ...localOnly];
       }
     }
@@ -169,7 +194,6 @@ async function loadData() {
     console.warn("CSV load failed (expected on first run or missing file):", e);
   }
 
-  // Sort and render
   allRecords.sort((a, b) => new Date(b.createdDate) - new Date(a.createdDate));
   saveToLocalStorage();
   updateStorageBars();
@@ -240,7 +264,7 @@ document.getElementById("csv-file-input").addEventListener("change", async (e) =
       };
       allRecords.push(record);
       importedCount++;
-      if (record.price && record.createdDate) addToMonthly(record.createdDate, record.price, 0);
+      if (record.price && record.createdDate) addToMonthly(record.createdDate, record.price);
     }
     msg.textContent = `✓ ${importedCount} records imported.`;
     msg.className = "form-msg ok";
@@ -319,13 +343,12 @@ document.getElementById("btn-submit").addEventListener("click", () => {
     isDummy: false
   };
 
-  const profit = interestToggled ? Math.ceil(price / 500) * 50 : 0;
   if (interestToggled) {
     record.interestDates = [todayDDMMYY()];
   }
 
   allRecords.unshift(record);
-  addToMonthly(now, price, profit);
+  addToMonthly(now, price);
   saveToLocalStorage();
   renderRecords();
 
@@ -377,7 +400,7 @@ function renderStorageBar(elId, count, max) {
     </div>`;
 }
 
-// ── Auto-delete (localStorage equivalent) ─────────────────────────────────────
+// ── Auto-delete ─────────────────────────────────────────────────────────────
 function runAutoDelete() {
   const now = Date.now();
   let changed = false;
@@ -420,7 +443,7 @@ function renderRecords() {
   const el       = document.getElementById("records-list");
 
   const totalVal    = active.reduce((s, r) => s + (Number(r.price) || 0), 0);
-  const totalProfit = Object.values(monthlyStats).reduce((s, m) => s + (m.profit || 0), 0);
+  const totalProfit = calculateTotalInterestProfit();
   document.getElementById("rec-total-value").textContent  = "₹" + totalVal.toLocaleString("en-IN");
   document.getElementById("rec-total-profit").textContent = "₹" + totalProfit.toLocaleString("en-IN");
   document.getElementById("rec-count").textContent        = active.length;
@@ -713,13 +736,10 @@ function attachCardEvents(container) {
         showModal("Remove this record? (will not affect stats)", () => {
           const rec = allRecords.find(r => r._docId === docId);
           if (rec) {
-            const key        = monthKey(rec.createdDate);
-            const price      = Number(rec.price) || 0;
-            const interestCount = (rec.interestDates || []).length;
-            const interestProfit = interestCount * Math.ceil(price / 500) * 50;
+            const key = monthKey(rec.createdDate);
+            const price = Number(rec.price) || 0;
             if (monthlyStats[key]) {
-              monthlyStats[key].cost   = Math.max(0, (monthlyStats[key].cost   || 0) - price);
-              monthlyStats[key].profit = Math.max(0, (monthlyStats[key].profit || 0) - interestProfit);
+              monthlyStats[key].cost = Math.max(0, (monthlyStats[key].cost || 0) - price);
               if (monthlyStats[key].cost === 0 && monthlyStats[key].profit === 0) delete monthlyStats[key];
             }
           }
@@ -781,10 +801,8 @@ function attachCardEvents(container) {
         const dates = rec.interestDates || [];
         const today = todayDDMMYY();
         showModal(`Record interest paid (${today})?`, () => {
-          const profit = Math.ceil((Number(rec.price) || 0) / 500) * 50;
-          const now    = new Date().toISOString();
+          // Just add the date to the record — profit is calculated dynamically
           rec.interestDates = [...dates, today];
-          addToMonthly(now, 0, profit);
           saveToLocalStorage();
           renderRecords(); renderReturned(); renderSold(); renderPending();
         });
@@ -816,17 +834,8 @@ document.getElementById("edit-bulk-add").addEventListener("click", () => {
 
   if (invalid.length) { msg.textContent = `Invalid: ${invalid.join(", ")}`; msg.className = "form-msg err"; return; }
 
-  const allDates = [...existing];
-  rec.interestDates = allDates;
-
-  const profit = Math.ceil((Number(rec.price) || 0) / 500) * 50;
-  for (const d of added) {
-    const dt  = parseDDMMYY(d);
-    const key = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}`;
-    if (!monthlyStats[key]) monthlyStats[key] = { cost: 0, profit: 0 };
-    monthlyStats[key].profit = (monthlyStats[key].profit || 0) + profit;
-  }
-
+  // Just update the record's interest dates — profit is calculated dynamically
+  rec.interestDates = [...existing];
   saveToLocalStorage();
 
   let resultMsg = `✓ ${added.length} date(s) added.`;
@@ -843,27 +852,9 @@ document.getElementById("edit-cancel").addEventListener("click", () => {
 document.getElementById("edit-clear-interest").addEventListener("click", () => {
   const docId = document.getElementById("edit-doc-id").value;
   if (!docId) return;
-  showModal("Clear all interest dates for this record? Already-accrued profit will be subtracted from monthly stats.", () => {
+  showModal("Clear all interest dates for this record?", () => {
     const rec = allRecords.find(r => r._docId === docId);
     if (rec) {
-      // Deduct profit for each cleared interest date
-      const profitPerCycle = Math.ceil((Number(rec.price) || 0) / 500) * 50;
-      const clearedDates = rec.interestDates || [];
-      for (const d of clearedDates) {
-        let dt;
-        if (d.includes(".")) {
-          dt = parseDDMMYY(d);
-        } else {
-          dt = new Date(d);
-        }
-        if (dt && !isNaN(dt.getTime())) {
-          const key = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}`;
-          if (monthlyStats[key]) {
-            monthlyStats[key].profit = Math.max(0, (monthlyStats[key].profit || 0) - profitPerCycle);
-            if (monthlyStats[key].cost === 0 && monthlyStats[key].profit === 0) delete monthlyStats[key];
-          }
-        }
-      }
       rec.interestDates = [];
     }
     saveToLocalStorage();
@@ -906,7 +897,7 @@ document.getElementById("modal-confirm").addEventListener("click", async () => {
 function renderStats() {
   const active      = allRecords.filter(r => r.status === "active");
   const activeValue = active.reduce((s, r) => s + (Number(r.price) || 0), 0);
-  const activeProfit = Object.values(monthlyStats).reduce((s, m) => s + (m.profit || 0), 0);
+  const activeProfit = calculateTotalInterestProfit();
 
   document.getElementById("stat-active-value").textContent   = "₹" + activeValue.toLocaleString("en-IN");
   document.getElementById("stat-interest").textContent       = "₹" + activeProfit.toLocaleString("en-IN");
@@ -914,24 +905,25 @@ function renderStats() {
   document.getElementById("stat-count-sold").textContent     = allRecords.filter(r => r.status === "sold").length;
   document.getElementById("stat-count-returned").textContent = allRecords.filter(r => r.status === "returned").length;
 
-  // Compute from live records (non-dummy only)
+  // Compute cost from live records
   const computed = {};
   allRecords.forEach(r => {
     if (r.isDummy) return;
     if (!r.createdDate) return;
     const key = monthKey(r.createdDate);
-    if (!computed[key]) computed[key] = { cost: 0, profit: 0 };
+    if (!computed[key]) computed[key] = { cost: 0 };
     computed[key].cost += Number(r.price) || 0;
   });
 
-  // Merge: take cost from whichever is higher, profit ONLY from persisted (real interest clicks)
+  // Build merged data: cost from computed, profit dynamically from records
+  const monthlyProfit = calculateMonthlyProfit();
   const merged = {};
-  const allKeys = new Set([...Object.keys(computed), ...Object.keys(monthlyStats)]);
+  const allKeys = new Set([...Object.keys(computed), ...Object.keys(monthlyProfit), ...Object.keys(monthlyStats)]);
   allKeys.forEach(k => {
-    const c = computed[k]     || { cost: 0, profit: 0 };
-    const p = monthlyStats[k] || { cost: 0, profit: 0 };
-    const cost   = Math.max(c.cost || 0, p.cost || 0);
-    const profit = p.profit || 0;
+    const c = computed[k] ? computed[k].cost : 0;
+    const pCost = monthlyStats[k] ? (monthlyStats[k].cost || 0) : 0;
+    const cost = Math.max(c, pCost);
+    const profit = monthlyProfit[k] || 0;
     if (cost > 0 || profit > 0) merged[k] = { cost, profit };
   });
 
@@ -971,7 +963,7 @@ function renderMonthlyList(merged) {
     </div>
   `).join("");
 
-  // Tap to delete month
+  // Tap to delete month (only affects persisted cost in monthlyStats, profit is dynamic)
   el.querySelectorAll(".month-row[data-month-key]").forEach(row => {
     row.addEventListener("click", () => {
       const key = row.dataset.monthKey;
@@ -1031,9 +1023,8 @@ function renderChart(merged) {
 document.getElementById("btn-reset-profits").addEventListener("click", () => {
   showModal("Reset ALL monthly profits to zero? This cannot be undone.", () => {
     const msg = document.getElementById("reset-msg");
-    Object.keys(monthlyStats).forEach(k => {
-      monthlyStats[k].profit = 0;
-    });
+    // Clear all interest dates from all records
+    allRecords.forEach(r => { r.interestDates = []; });
     saveToLocalStorage();
     msg.textContent = "All profits reset to zero.";
     msg.className = "form-msg ok";
