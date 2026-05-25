@@ -86,12 +86,21 @@ function setConnStatus(text, color) {
   }
 }
 
+// Helper: parse DD.MM.YY date string to a comparable value
+function parseDateForSort(dateStr) {
+  if (!dateStr) return 0;
+  const m = dateStr.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (!m) return 0;
+  const d = parseInt(m[1]), mo = parseInt(m[2]), y = parseInt(m[3]) + 2000;
+  return new Date(y, mo - 1, d).getTime();
+}
+
 async function supabaseFetchAll() {
   if (!supabaseClient) throw new Error("Supabase not configured");
   const { data, error } = await supabaseClient
     .from(TABLE_RECORDS)
     .select("*")
-    .order("created_date", { ascending: false });
+    .order("date", { ascending: false });
   if (error) throw error;
   return data || [];
 }
