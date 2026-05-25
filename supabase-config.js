@@ -1,10 +1,9 @@
 // ── Supabase Configuration ─────────────────────────────────────────────────────
 // These values are public (anon key is safe for client-side use with RLS).
-// Replace with your own Supabase project credentials.
 // Get them from: https://app.supabase.com → Project Settings → API
 
-const SUPABASE_URL = "";
-const SUPABASE_ANON_KEY = "";
+const SUPABASE_URL = "https://huwdlteowjpqgrzaqmpc.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_3kJIv_o-6w_UFp9mXtezvg_k5jqYsRT";
 
 // Initialize Supabase client
 let supabaseClient = null;
