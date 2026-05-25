@@ -1017,6 +1017,8 @@ document.getElementById("edit-confirm").addEventListener("click", async () => {
     try {
       if (rec._dbId) await supabaseUpdate(rec._dbId, rec);
     } catch(e) {}
+    // Re-sort all records by Date (newest first)
+    allRecords.sort((a, b) => parseDateForSort(b.date) - parseDateForSort(a.date));
     renderRecords(); renderReturned(); renderSold(); renderPending();
   }
   document.getElementById("edit-modal").classList.add("hidden");
