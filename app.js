@@ -980,15 +980,31 @@ document.getElementById("edit-clear-interest").addEventListener("click", async (
   });
 });
 
+// Helper: Convert DD.MM.YY to ISO date string for createdDate
+function dmyToISO(dateStr) {
+  if (!dateStr) return new Date().toISOString();
+  const m = dateStr.trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (m) {
+    let [, d, mo, y] = m;
+    if (y.length === 2) y = "20" + y;
+    const dt = new Date(parseInt(y), parseInt(mo) - 1, parseInt(d));
+    if (!isNaN(dt.getTime())) return dt.toISOString();
+  }
+  return new Date().toISOString();
+}
+
 document.getElementById("edit-confirm").addEventListener("click", async () => {
   const docId = document.getElementById("edit-doc-id").value;
   const rec = allRecords.find(r => r._docId === docId);
   if (rec) {
+    const newDate = document.getElementById("edit-date").value.trim();
     rec.id          = document.getElementById("edit-id").value.trim();
-    rec.date        = document.getElementById("edit-date").value.trim();
+    rec.date        = newDate;
     rec.description = document.getElementById("edit-desc").value.trim();
     rec.phone       = document.getElementById("edit-phone").value.trim();
     rec.price       = parseFloat(document.getElementById("edit-price").value) || 0;
+    // When date changes, update createdDate to match
+    rec.createdDate = dmyToISO(newDate);
     try {
       if (rec._dbId) await supabaseUpdate(rec._dbId, rec);
     } catch(e) {}
