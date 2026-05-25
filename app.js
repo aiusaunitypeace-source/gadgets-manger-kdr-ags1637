@@ -97,10 +97,10 @@ function parseDateForSort(dateStr) {
 
 async function supabaseFetchAll() {
   if (!supabaseClient) throw new Error("Supabase not configured");
+  // Fetch unsorted — we sort client-side by parsed date for proper year/month/day ordering
   const { data, error } = await supabaseClient
     .from(TABLE_RECORDS)
-    .select("*")
-    .order("date", { ascending: false });
+    .select("*");
   if (error) throw error;
   return data || [];
 }
@@ -250,6 +250,10 @@ async function loadData() {
     }));
 
     monthlyStats = monthly;
+
+    // Sort by parsed Date (newest first) — handles cross-year properly
+    // e.g., 01.01.26 comes before 31.12.25
+    allRecords.sort((a, b) => parseDateForSort(b.date) - parseDateForSort(a.date));
 
     setConnStatus("✅ Connected — " + allRecords.length + " records loaded", "#16a34a");
     isLoading = false;
